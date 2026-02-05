@@ -505,11 +505,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "C:\\Users\\MSI VN\\source\\repos\\CozeFptWebhook\\CozeFptWebhook\\CozeFptWebhook.csproj",
+      "projectUniqueName": "C:\\Users\\MSI VN\\source\\repos\\CozeFptWebhook\\CozeFptWebhook\\CozeFptWebhook\\CozeFptWebhook.csproj",
       "projectName": "CozeFptWebhook",
-      "projectPath": "C:\\Users\\MSI VN\\source\\repos\\CozeFptWebhook\\CozeFptWebhook\\CozeFptWebhook.csproj",
+      "projectPath": "C:\\Users\\MSI VN\\source\\repos\\CozeFptWebhook\\CozeFptWebhook\\CozeFptWebhook\\CozeFptWebhook.csproj",
       "packagesPath": "C:\\Users\\MSI VN\\.nuget\\packages\\",
-      "outputPath": "C:\\Users\\MSI VN\\source\\repos\\CozeFptWebhook\\CozeFptWebhook\\obj\\",
+      "outputPath": "C:\\Users\\MSI VN\\source\\repos\\CozeFptWebhook\\CozeFptWebhook\\CozeFptWebhook\\obj\\",
       "projectStyle": "PackageReference",
       "fallbackFolders": [
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"

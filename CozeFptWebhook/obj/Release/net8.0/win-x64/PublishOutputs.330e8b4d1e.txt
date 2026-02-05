@@ -1,0 +1,5 @@
+C:\Users\MSI VN\source\repos\CozeFptWebhook\CozeFptWebhook\bin\Release\net8.0\win-x64\publish\appsettings.Development.json
+C:\Users\MSI VN\source\repos\CozeFptWebhook\CozeFptWebhook\bin\Release\net8.0\win-x64\publish\appsettings.json
+C:\Users\MSI VN\source\repos\CozeFptWebhook\CozeFptWebhook\bin\Release\net8.0\win-x64\publish\CozeFptWebhook.pdb
+C:\Users\MSI VN\source\repos\CozeFptWebhook\CozeFptWebhook\bin\Release\net8.0\win-x64\publish\aspnetcorev2_inprocess.dll
+C:\Users\MSI VN\source\repos\CozeFptWebhook\CozeFptWebhook\bin\Release\net8.0\win-x64\publish\CozeFptWebhook.exe

@@ -15,7 +15,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("CozeFptWebhook")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a53a968dc5b9dcbd3fd8f293189be4db8ce78478")]
 [assembly: System.Reflection.AssemblyProductAttribute("CozeFptWebhook")]
 [assembly: System.Reflection.AssemblyTitleAttribute("CozeFptWebhook")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
