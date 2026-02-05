@@ -1,163 +1,148 @@
 ﻿using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Caching.Memory;
-Console.OutputEncoding = Encoding.UTF8;
+using Microsoft.Extensions.Primitives;
 
 var builder = WebApplication.CreateBuilder(args);
-var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
-builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
+
+// ✅ Render/Linux hay bị inotify limit => tắt reloadOnChange để tránh Exit 139
+builder.Host.ConfigureAppConfiguration((ctx, cfg) =>
+{
+    cfg.Sources.Clear();
+    cfg.AddJsonFile("appsettings.json", optional: true, reloadOnChange: false);
+    cfg.AddJsonFile($"appsettings.{ctx.HostingEnvironment.EnvironmentName}.json", optional: true, reloadOnChange: false);
+    cfg.AddEnvironmentVariables();
+
+    if (ctx.HostingEnvironment.IsDevelopment())
+        cfg.AddUserSecrets<Program>(optional: true);
+});
+
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
-
-// Lưu conversation_id theo email (in-memory)
 builder.Services.AddMemoryCache();
 
-builder.Services.AddHttpClient("coze", client =>
-{
-    client.Timeout = TimeSpan.FromSeconds(25);
-});
-
-builder.Services.AddHttpClient("fchat", client =>
-{
-    client.Timeout = TimeSpan.FromSeconds(15);
-});
+builder.Services.AddHttpClient("coze", c => c.Timeout = TimeSpan.FromSeconds(25));
+builder.Services.AddHttpClient("fchat", c => c.Timeout = TimeSpan.FromSeconds(15));
 
 var app = builder.Build();
-app.UseSwagger();
-app.UseSwaggerUI();
 
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+app.MapGet("/", () => Results.Ok(new { ok = true }));
 app.MapGet("/health", () => Results.Ok(new { ok = true }));
 
-// -------------------- FCHAT INCOMING WEBHOOK --------------------
-app.MapPost("/webhook/fchat", async (
+app.MapPost("/webhook/fchat", HandleFChatAsync);
+app.MapPost("/webhook/fpt", HandleFptAsync).WithName("FptWebhook");
+
+app.Run();
+
+static async Task<IResult> HandleFChatAsync(
     HttpRequest request,
     IHttpClientFactory httpClientFactory,
     IConfiguration config,
-    IMemoryCache cache) =>
+    IMemoryCache cache,
+    ILogger<Program> log)
 {
-    Console.WriteLine("[FCHAT] incoming webhook called");
+    var trace = request.HttpContext.TraceIdentifier;
+    var ct = request.HttpContext.RequestAborted;
 
-    // 1) Đọc raw body
-    var raw = await new StreamReader(request.Body, Encoding.UTF8).ReadToEndAsync();
-    Console.WriteLine("[FCHAT] raw body preview=" + (raw.Length > 800 ? raw[..800] + "..." : raw));
+    // ✅ 0) BẮT BUỘC api_key trên query (sai/thiếu => 401)
+    if (!TryAuthorizeQueryApiKey(request, config, "Security:FChatApiKey", log, trace, out var authFail))
+        return authFail!;
 
+    // ✅ 0b) Optional: header secret (nếu bạn cấu hình FChat gọi được header)
+    if (!TryAuthorizeHeaderSecret(request, config["FChat:WebhookSecret"], "X-Webhook-Secret", log, trace, out var secFail))
+        return secFail!;
+
+    // 1) Read body
+    var raw = await new StreamReader(request.Body, Encoding.UTF8).ReadToEndAsync(ct);
     if (string.IsNullOrWhiteSpace(raw))
-        return Results.Ok(new { ok = true });
-
-    // 2) Parse JSON theo payload bạn đang test:
-    // { message: { text: "...", user: { email: "..." } } }
-    string text = "";
-    string email = "";
-
-    try
     {
-        using var doc = JsonDocument.Parse(raw);
-        var root = doc.RootElement;
-
-        if (root.TryGetProperty("message", out var msg) && msg.ValueKind == JsonValueKind.Object)
-        {
-            if (msg.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String)
-                text = t.GetString() ?? "";
-
-            if (msg.TryGetProperty("user", out var user) && user.ValueKind == JsonValueKind.Object)
-            {
-                if (user.TryGetProperty("email", out var e) && e.ValueKind == JsonValueKind.String)
-                    email = e.GetString() ?? "";
-            }
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine("[FCHAT] JSON parse error: " + ex.Message);
+        log.LogInformation("[FCHAT] trace={Trace} empty body", trace);
         return Results.Ok(new { ok = true });
     }
 
-    // ✅ Vị trí #3 bạn hỏi: log email + text sau parse
-    Console.WriteLine($"[FCHAT] email={email} text={text}");
-
-    if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(text))
+    // 2) Parse payload
+    if (!TryParseFChatPayload(raw, out var email, out var text))
     {
-        Console.WriteLine("[FCHAT] Missing email/text -> ignore");
+        log.LogWarning("[FCHAT] trace={Trace} invalid payload", trace);
         return Results.Ok(new { ok = true });
     }
 
-    // 3) Lấy conversation_id đã lưu theo email (để Coze nhớ)
-    var cacheKey = "coze:cid:" + email.Trim().ToLowerInvariant();
-    var existingCid = cache.Get<string>(cacheKey) ?? "";
-    Console.WriteLine("[FCHAT] existing conversation_id=" + existingCid);
+    log.LogInformation("[FCHAT] trace={Trace} emailHash={EmailHash} email={EmailMasked} textLen={Len} textPreview={Preview}",
+        trace, Sha256Short(email), MaskEmail(email), text.Length, Preview(text));
 
-    // 4) Gọi Coze
-    Console.WriteLine("[FCHAT] calling Coze...");
-    var (answer, newCid, debug) = await AskCozeAsync(
-        httpClientFactory,
-        config,
-        userId: email,          // dùng email làm user_id cho ổn định
+    // 3) Cache conversation_id theo email
+    var cacheKey = $"fchat:cid:{email.Trim().ToLowerInvariant()}";
+    var conversationId = cache.TryGetValue(cacheKey, out string? cid) ? cid : null;
+
+    // 4) Call Coze
+    var (ok, answer, newCid, err) = await AskCozeAsync(
+        httpClientFactory, config, log,
+        userId: email,
         text: text,
-        conversationId: existingCid);
+        conversationId: conversationId,
+        ct: ct);
 
-    Console.WriteLine("[FCHAT] Coze answer preview=" + (answer.Length > 120 ? answer[..120] + "..." : answer));
-    Console.WriteLine("[FCHAT] new conversation_id=" + newCid);
+    if (!ok)
+    {
+        log.LogWarning("[FCHAT] trace={Trace} coze failed: {Err}", trace, Preview(err, 300));
+        answer = "Hệ thống đang bận hoặc cấu hình Coze chưa đúng. Vui lòng thử lại sau.";
+    }
 
-    // lưu conversation_id mới
     if (!string.IsNullOrWhiteSpace(newCid))
-        cache.Set(cacheKey, newCid, TimeSpan.FromDays(7));
+    {
+        cache.Set(cacheKey, newCid, new MemoryCacheEntryOptions
+        {
+            SlidingExpiration = TimeSpan.FromHours(12)
+        });
+    }
 
-    // nếu Coze fail mà answer rỗng -> dùng debug
-    if (string.IsNullOrWhiteSpace(answer))
-        answer = string.IsNullOrWhiteSpace(debug)
-            ? "Mình chưa có câu trả lời phù hợp. Bạn thử lại nhé."
-            : $"Coze lỗi/không trả answer. Debug: {debug}";
-
-    // 5) Gửi trả lời ngược về FChat (User Messaging API)
+    // 5) Send back to FChat
     var baseUrl = config["FChat:BaseUrl"] ?? "https://alerts.soc.fpt.net/webhooks";
     var token = config["FChat:Token"];
 
     if (string.IsNullOrWhiteSpace(token))
     {
-        Console.WriteLine("[FCHAT] Missing FChat:Token");
+        log.LogError("[FCHAT] trace={Trace} missing FChat:Token", trace);
         return Results.Ok(new { ok = true });
     }
 
     var sendUrl = $"{baseUrl.TrimEnd('/')}/{token}/fchat";
-    Console.WriteLine("[FCHAT] sending back to FChat...");
-    Console.WriteLine("[FCHAT] sendUrl=" + sendUrl);
-
     var sendBody = new { email, text = answer };
 
     var fchat = httpClientFactory.CreateClient("fchat");
     using var sendResp = await fchat.PostAsync(
         sendUrl,
-        new StringContent(JsonSerializer.Serialize(sendBody), Encoding.UTF8, "application/json")
-    );
+        new StringContent(JsonSerializer.Serialize(sendBody), Encoding.UTF8, "application/json"),
+        ct);
 
-    Console.WriteLine($"[FCHAT] send status={(int)sendResp.StatusCode}");
+    log.LogInformation("[FCHAT] trace={Trace} sendStatus={Status} sendUrlMasked={Masked}",
+        trace, (int)sendResp.StatusCode, $"{baseUrl.TrimEnd('/')}/{MaskToken(token)}/fchat");
 
-    if (!sendResp.IsSuccessStatusCode)
-    {
-        var errBody = await sendResp.Content.ReadAsStringAsync();
-        Console.WriteLine("[FCHAT] send error body=" + errBody);
-    }
-
-    // 6) Theo tài liệu: Iris/FChat incoming webhook cần {ok:true}
     return Results.Ok(new { ok = true });
-});
+}
 
-// -------------------- FPT -> COZE WEBHOOK (GIỮ NGUYÊN, CHỈ TÁI DÙNG AskCozeAsync) --------------------
-app.MapPost("/webhook/fpt", async (HttpRequest request, IHttpClientFactory httpClientFactory, IConfiguration config) =>
+static async Task<IResult> HandleFptAsync(
+    HttpRequest request,
+    IHttpClientFactory httpClientFactory,
+    IConfiguration config,
+    IMemoryCache cache,
+    ILogger<Program> log)
 {
-    Console.WriteLine("[WEBHOOK] /webhook/fpt called");
+    var trace = request.HttpContext.TraceIdentifier;
+    var ct = request.HttpContext.RequestAborted;
 
-    // Verify shared secret
-    var expectedSecret = config["Fpt:WebhookSecret"];
-    if (string.IsNullOrWhiteSpace(expectedSecret))
-        return Results.Problem("Missing Fpt:WebhookSecret config");
+    if (!TryAuthorizeHeaderSecret(request, config["Fpt:WebhookSecret"], "X-Webhook-Secret", log, trace, out var fail))
+        return fail!;
 
-    if (!request.Headers.TryGetValue("X-Webhook-Secret", out var secret) || secret != expectedSecret)
-        return Results.Unauthorized();
-
-    // Read body
-    var raw = await new StreamReader(request.Body, Encoding.UTF8).ReadToEndAsync();
+    var raw = await new StreamReader(request.Body, Encoding.UTF8).ReadToEndAsync(ct);
     if (string.IsNullOrWhiteSpace(raw))
     {
         return Results.Json(new
@@ -169,24 +154,22 @@ app.MapPost("/webhook/fpt", async (HttpRequest request, IHttpClientFactory httpC
     using var doc = JsonDocument.Parse(raw);
     var root = doc.RootElement;
 
-    string GetString(params string[] keys)
+    static string GetString(JsonElement r, params string[] keys)
     {
         foreach (var k in keys)
-        {
-            if (root.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String)
+            if (r.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String)
             {
                 var s = v.GetString();
                 if (!string.IsNullOrWhiteSpace(s)) return s!;
             }
-        }
         return "";
     }
 
-    var senderId = GetString("sender_id", "senderId", "user_id", "userId");
+    var senderId = GetString(root, "sender_id", "senderId", "user_id", "userId");
     if (string.IsNullOrWhiteSpace(senderId)) senderId = "anonymous";
 
-    var text = GetString("sender_input", "text", "message", "query");
-    var conversationId = GetString("coze_conversation_id", "conversation_id");
+    var text = GetString(root, "sender_input", "text", "message", "query");
+    var conversationId = GetString(root, "coze_conversation_id", "conversation_id");
 
     if (string.IsNullOrWhiteSpace(text))
     {
@@ -196,36 +179,160 @@ app.MapPost("/webhook/fpt", async (HttpRequest request, IHttpClientFactory httpC
         });
     }
 
-    var (answer, newCid, debug) = await AskCozeAsync(httpClientFactory, config, senderId, text, conversationId);
+    if (string.IsNullOrWhiteSpace(conversationId))
+    {
+        var key = $"fpt:cid:{senderId}";
+        if (cache.TryGetValue(key, out string? cachedCid)) conversationId = cachedCid;
+    }
 
-    if (string.IsNullOrWhiteSpace(answer))
-        answer = string.IsNullOrWhiteSpace(debug)
-            ? "Mình chưa có câu trả lời phù hợp. Bạn thử hỏi lại theo cách khác nhé."
-            : $"Coze không trả answer. Debug: {debug}";
+    log.LogInformation("[FPT] trace={Trace} senderHash={SenderHash} textLen={Len} textPreview={Preview} cidExists={HasCid}",
+        trace, Sha256Short(senderId), text.Length, Preview(text), !string.IsNullOrWhiteSpace(conversationId));
+
+    var (ok, answer, newCid, err) = await AskCozeAsync(
+        httpClientFactory, config, log,
+        userId: senderId,
+        text: text,
+        conversationId: conversationId,
+        ct: ct);
+
+    if (!ok)
+    {
+        log.LogWarning("[FPT] trace={Trace} coze failed: {Err}", trace, Preview(err, 300));
+        answer = "Hệ thống đang bận hoặc cấu hình Coze chưa đúng. Vui lòng thử lại sau.";
+    }
+
+    if (!string.IsNullOrWhiteSpace(newCid))
+    {
+        cache.Set($"fpt:cid:{senderId}", newCid, new MemoryCacheEntryOptions
+        {
+            SlidingExpiration = TimeSpan.FromHours(12)
+        });
+    }
 
     return Results.Json(new
     {
         set_attributes = new { coze_conversation_id = newCid ?? "" },
         messages = new[] { new { type = "text", content = new { text = answer } } }
     });
-})
-.WithName("FptWebhook");
+}
 
+// ======================= AUTH HELPERS =======================
 
-// -------------------- SHARED: CALL COZE + PARSE SSE --------------------
-static async Task<(string Answer, string NewConversationId, string Debug)> AskCozeAsync(
+static bool TryAuthorizeQueryApiKey(
+    HttpRequest request,
+    IConfiguration config,
+    string configPath,
+    ILogger log,
+    string trace,
+    out IResult? fail)
+{
+    // Render env: Security__FChatApiKey  => config["Security:FChatApiKey"]
+    var expected = config[configPath];
+
+    // ✅ Không có cấu hình => coi là lỗi cấu hình (500) để bạn biết mà sửa
+    if (string.IsNullOrWhiteSpace(expected))
+    {
+        log.LogError("[AUTH] trace={Trace} missing config {ConfigPath}", trace, configPath);
+        fail = Results.Problem($"Missing config: {configPath}");
+        return false;
+    }
+
+    if (!request.Query.TryGetValue("api_key", out StringValues provided) || StringValues.IsNullOrEmpty(provided))
+    {
+        log.LogWarning("[AUTH] trace={Trace} missing api_key", trace);
+        fail = Results.Unauthorized();
+        return false;
+    }
+
+    if (!FixedTimeEqualsUtf8(expected, provided.ToString()))
+    {
+        log.LogWarning("[AUTH] trace={Trace} invalid api_key (providedHash={Hash})", trace, Sha256Short(provided.ToString()));
+        fail = Results.Unauthorized();
+        return false;
+    }
+
+    fail = null;
+    return true;
+}
+
+static bool TryAuthorizeHeaderSecret(
+    HttpRequest request,
+    string? expected,
+    string headerName,
+    ILogger log,
+    string trace,
+    out IResult? fail)
+{
+    if (string.IsNullOrWhiteSpace(expected))
+    {
+        fail = null;
+        return true; // không cấu hình => bỏ qua
+    }
+
+    if (!request.Headers.TryGetValue(headerName, out var got) || StringValues.IsNullOrEmpty(got))
+    {
+        log.LogWarning("[AUTH] trace={Trace} missing header {Header}", trace, headerName);
+        fail = Results.Unauthorized();
+        return false;
+    }
+
+    if (!FixedTimeEqualsUtf8(expected, got.ToString()))
+    {
+        log.LogWarning("[AUTH] trace={Trace} invalid header {Header}", trace, headerName);
+        fail = Results.Unauthorized();
+        return false;
+    }
+
+    fail = null;
+    return true;
+}
+
+static bool FixedTimeEqualsUtf8(string a, string b)
+{
+    var ab = Encoding.UTF8.GetBytes(a);
+    var bb = Encoding.UTF8.GetBytes(b);
+    return ab.Length == bb.Length && CryptographicOperations.FixedTimeEquals(ab, bb);
+}
+
+// ======================= PAYLOAD PARSER =======================
+
+static bool TryParseFChatPayload(string raw, out string email, out string text)
+{
+    email = "";
+    text = "";
+
+    using var doc = JsonDocument.Parse(raw);
+    var root = doc.RootElement;
+
+    if (!root.TryGetProperty("message", out var msg) || msg.ValueKind != JsonValueKind.Object) return false;
+    if (!msg.TryGetProperty("text", out var t) || t.ValueKind != JsonValueKind.String) return false;
+    if (!msg.TryGetProperty("user", out var user) || user.ValueKind != JsonValueKind.Object) return false;
+    if (!user.TryGetProperty("email", out var e) || e.ValueKind != JsonValueKind.String) return false;
+
+    text = t.GetString() ?? "";
+    email = e.GetString() ?? "";
+
+    return !(string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(text));
+}
+
+// ======================= COZE CALLER =======================
+
+static async Task<(bool Ok, string Answer, string? NewConversationId, string? Error)>
+AskCozeAsync(
     IHttpClientFactory httpClientFactory,
     IConfiguration config,
+    ILogger log,
     string userId,
     string text,
-    string conversationId)
+    string? conversationId,
+    CancellationToken ct)
 {
     var cozeBaseUrl = config["Coze:BaseUrl"] ?? "https://api.coze.com";
     var cozePat = config["Coze:Pat"];
     var cozeBotId = config["Coze:BotId"];
 
     if (string.IsNullOrWhiteSpace(cozePat) || string.IsNullOrWhiteSpace(cozeBotId))
-        return ("", conversationId, "Missing Coze config (Coze:Pat / Coze:BotId)");
+        return (false, "", null, "Missing Coze config (Pat/BotId)");
 
     var url = $"{cozeBaseUrl.TrimEnd('/')}/v3/chat";
     if (!string.IsNullOrWhiteSpace(conversationId))
@@ -249,34 +356,32 @@ static async Task<(string Answer, string NewConversationId, string Debug)> AskCo
     reqMsg.Headers.Authorization = new AuthenticationHeaderValue("Bearer", cozePat);
     reqMsg.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
 
-    using var resp = await http.SendAsync(reqMsg, HttpCompletionOption.ResponseHeadersRead);
+    using var resp = await http.SendAsync(reqMsg, HttpCompletionOption.ResponseHeadersRead, ct);
 
-    var ct = resp.Content?.Headers.ContentType?.ToString() ?? "";
-    Console.WriteLine($"[COZE-RESP] status={(int)resp.StatusCode} content-type={ct}");
+    var contentType = resp.Content?.Headers.ContentType?.ToString() ?? "";
+    log.LogInformation("[COZE] status={Status} contentType={ContentType}", (int)resp.StatusCode, contentType);
 
     if (!resp.IsSuccessStatusCode || resp.Content == null)
     {
-        var err = resp.Content == null ? "(no content)" : await resp.Content.ReadAsStringAsync();
-        return ("", conversationId, $"HTTP {(int)resp.StatusCode}: {err}");
+        var err = resp.Content == null ? "(no content)" : await resp.Content.ReadAsStringAsync(ct);
+        return (false, "", null, $"Coze HTTP {(int)resp.StatusCode}: {Preview(err, 300)}");
     }
 
     var mediaType = resp.Content.Headers.ContentType?.MediaType ?? "";
-    if (!mediaType.Contains("text/event-stream"))
+    if (!mediaType.Contains("text/event-stream", StringComparison.OrdinalIgnoreCase))
     {
-        var json = await resp.Content.ReadAsStringAsync();
-        Console.WriteLine("[COZE-JSON] " + (json.Length > 800 ? json[..800] + "..." : json));
-        return ("", conversationId, "Coze returned JSON (not SSE). See [COZE-JSON].");
+        var json = await resp.Content.ReadAsStringAsync(ct);
+        return (false, "", null, $"Coze JSON (non-stream): {Preview(json, 300)}");
     }
 
-    // SSE state
+    // SSE parse
     string currentEvent = "";
     var dataLines = new List<string>();
     bool done = false;
 
-    string newConversationId = conversationId;
+    string? newConversationId = conversationId;
     var answerDelta = new StringBuilder();
     string completedAnswer = "";
-    string failInfo = "";
 
     static string ExtractAssistantText(JsonElement r)
     {
@@ -296,20 +401,13 @@ static async Task<(string Answer, string NewConversationId, string Debug)> AskCo
 
     void Dispatch()
     {
-        if (string.IsNullOrWhiteSpace(currentEvent))
-        {
-            dataLines.Clear();
-            return;
-        }
+        if (string.IsNullOrWhiteSpace(currentEvent)) { dataLines.Clear(); return; }
 
         var dataStr = string.Join("\n", dataLines).Trim();
-        Console.WriteLine($"[COZE] event={currentEvent} data={(dataStr.Length > 300 ? dataStr[..300] + "..." : dataStr)}");
 
         if (currentEvent == "done")
         {
-            if (dataStr == "[DONE]" || dataStr == "\"[DONE]\"")
-                done = true;
-
+            if (dataStr == "[DONE]" || dataStr == "\"[DONE]\"") done = true;
             currentEvent = "";
             dataLines.Clear();
             return;
@@ -322,19 +420,16 @@ static async Task<(string Answer, string NewConversationId, string Debug)> AskCo
             return;
         }
 
-        // Lưu fail/debug nếu có
-        if (currentEvent is "conversation.chat.failed" or "conversation.chat.requires_action" or "error")
-            failInfo = $"{currentEvent}: {dataStr}";
-
         try
         {
             using var d = JsonDocument.Parse(dataStr);
             var r = d.RootElement;
 
-            if (currentEvent == "conversation.chat.created")
+            if (currentEvent == "conversation.chat.created" &&
+                r.TryGetProperty("conversation_id", out var cid) &&
+                cid.ValueKind == JsonValueKind.String)
             {
-                if (r.TryGetProperty("conversation_id", out var cid) && cid.ValueKind == JsonValueKind.String)
-                    newConversationId = cid.GetString() ?? newConversationId;
+                newConversationId = cid.GetString() ?? newConversationId;
             }
 
             if ((currentEvent == "conversation.message.delta" || currentEvent == "conversation.message.completed") &&
@@ -344,47 +439,32 @@ static async Task<(string Answer, string NewConversationId, string Debug)> AskCo
                 var s = ExtractAssistantText(r);
                 if (!string.IsNullOrWhiteSpace(s))
                 {
-                    if (currentEvent == "conversation.message.delta")
-                        answerDelta.Append(s);
-                    else
-                        completedAnswer = s;
+                    if (currentEvent == "conversation.message.delta") answerDelta.Append(s);
+                    else completedAnswer = s;
                 }
             }
         }
-        catch
-        {
-            // ignore parse errors
-        }
+        catch { }
 
         currentEvent = "";
         dataLines.Clear();
     }
 
-    await using var cozeStream = await resp.Content.ReadAsStreamAsync();
+    await using var cozeStream = await resp.Content.ReadAsStreamAsync(ct);
     using var sr = new StreamReader(cozeStream);
 
-    while (!sr.EndOfStream)
+    while (!ct.IsCancellationRequested)
     {
         var line = await sr.ReadLineAsync();
         if (line == null) break;
 
-        // raw sse (bạn có thể tắt nếu spam)
-        // Console.WriteLine("[SSE] " + line);
-
-        if (line.Length == 0)
-        {
-            Dispatch();
-            if (done) break;
-            continue;
-        }
-
-        if (line.StartsWith("event:"))
+        if (line.Length == 0) { Dispatch(); if (done) break; continue; }
+        if (line.StartsWith("event:", StringComparison.OrdinalIgnoreCase))
         {
             currentEvent = line["event:".Length..].Trim();
             continue;
         }
-
-        if (line.StartsWith("data:"))
+        if (line.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
         {
             dataLines.Add(line["data:".Length..].Trim());
             continue;
@@ -397,10 +477,39 @@ static async Task<(string Answer, string NewConversationId, string Debug)> AskCo
         ? completedAnswer.Trim()
         : answerDelta.ToString().Trim();
 
-    return (answer, newConversationId, failInfo);
+    return (true, answer, newConversationId, null);
 }
-app.MapGet("/", () => Results.Ok(new { ok = true, service = "CozeFptWebhook" }));
-app.MapGet("/webhook/fchat", () => Results.Ok(new { ok = true, hint = "Use POST /webhook/fchat" }));
 
-app.Run();
+// ======================= LOG HELPERS =======================
 
+static string Preview(string? s, int max = 160)
+{
+    if (string.IsNullOrEmpty(s)) return "";
+    s = s.Replace("\r", " ").Replace("\n", " ");
+    return s.Length <= max ? s : s[..max] + "...";
+}
+static string MaskToken(string? token)
+{
+    if (string.IsNullOrWhiteSpace(token)) return "";
+    if (token.Length <= 8) return "********";
+    return token[..4] + "****" + token[^4..];
+}
+static string MaskEmail(string? email)
+{
+    if (string.IsNullOrWhiteSpace(email)) return "";
+    var at = email.IndexOf('@');
+    if (at <= 1) return "***" + (at >= 0 ? email[at..] : "");
+    var name = email[..at];
+    var domain = email[at..];
+    var shown = name.Length <= 3 ? name[..1] : name[..2];
+    return $"{shown}***{domain}";
+}
+static string Sha256Short(string? s)
+{
+    if (string.IsNullOrWhiteSpace(s)) return "";
+    using var sha = SHA256.Create();
+    var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(s));
+    return Convert.ToHexString(bytes)[..10].ToLowerInvariant();
+}
+
+public partial class Program { }
